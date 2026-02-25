@@ -1,9 +1,7 @@
 /*
   ESP32 + BME280 (I2C) + Supabase REST
-  - On wake: connect WiFi, sync NTP, check if current minute is 00 or 30
-  - If minute is 00 or 30: read BME280 and POST to Supabase
-  - Otherwise: deep sleep until the next 00/30 minute slot
-  - Seconds are ignored (no strict boundary requirement)
+  - On wake: connect WiFi, sync NTP, read BME280 and POST to Supabase 
+  - Then: deep sleep until the next 00/30 minute slot
 
   Notes:
   - Uses client.setInsecure() for TLS simplicity.
@@ -17,6 +15,9 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
 #include <time.h>
+
+#include <esp_netif.h>
+#include <esp_sntp.h>
 
 // ---------------------- User configuration ----------------------
 
@@ -41,6 +42,7 @@ static const char* TZ_INFO = "WET0WEST,M3.5.0/1,M10.5.0/2";
 // Timeouts
 static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
 static const uint32_t HTTP_TIMEOUT_MS         = 8000;
+const unsigned long NTP_TIMEOUT_MS = 20000;
 
 // BME280 pins and address
 const uint8_t PIN_BME_SDA = 17;
@@ -50,16 +52,8 @@ const uint8_t BME_ADDRESS = 0x76; // Try 0x77 if needed
 
 Adafruit_BME280 bme;
 
-// ---------------------- Helpers: deep sleep ----------------------
-
-static void deepSleepSeconds(uint64_t seconds)
-{
-  if (seconds < 10) seconds = 10; // avoid rapid wake loops
-  esp_sleep_enable_timer_wakeup(seconds * 1000000ULL);
-  Serial.printf("[SLEEP] Deep sleeping for %llu seconds\n", seconds);
-  Serial.flush();
-  esp_deep_sleep_start();
-}
+const int SLEEP_DURATION = 30;
+const int WAKE_TIME = 06;
 
 // ---------------------- Helpers: WiFi ----------------------
 
@@ -90,95 +84,142 @@ static bool connectWiFi()
   return true;
 }
 
+void killWiFi()
+{
+  WiFi.disconnect();
+  WiFi.mode(WIFI_MODE_NULL);
+}
+
 // ---------------------- Helpers: NTP time sync ----------------------
 
-static bool syncTime()
+/* Waits for NTP server time sync, adjusted for the time zone specified in
+ * config.cpp.
+ *
+ * Returns true if time was set successfully, otherwise false.
+ *
+ * Note: Must be connected to WiFi to get time from NTP server.
+ */
+bool waitForSNTPSync(tm *timeInfo)
 {
-  setenv("TZ", TZ_INFO, 1);
-  tzset();
-
-  configTime(0, 0, NTP_SERVER_1, NTP_SERVER_2);
-
-  Serial.println("[TIME] Syncing via NTP...");
-  time_t now = 0;
-
-  // Wait up to ~10 seconds for a valid epoch
-  for (int i = 0; i < 40; i++)
+  // Wait for SNTP synchronization to complete
+  unsigned long timeout = millis() + NTP_TIMEOUT_MS;
+  if ((esp_sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET)
+      && (millis() < timeout))
   {
-    time(&now);
-    if (now > 1700000000) // sanity threshold
+    Serial.print("Waiting for SNTP synchronization.");
+    delay(100); // ms
+    while ((esp_sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET)
+        && (millis() < timeout))
     {
-      struct tm t;
-      localtime_r(&now, &t);
-      Serial.printf("[TIME] Synced: %04d-%02d-%02d %02d:%02d:%02d\n",
-                    t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
-                    t.tm_hour, t.tm_min, t.tm_sec);
-      return true;
+      Serial.print(".");
+      delay(100); // ms
     }
-    delay(250);
+    Serial.println();
   }
+  return printLocalTime(timeInfo);
+} // Credits: https://github.com/lmarzen/esp32-weather-epd
 
-  Serial.println("[TIME] NTP sync failed.");
-  return false;
-}
-
-// Returns seconds until the next minute slot where minute is 0 or 30.
-// Seconds are ignored in the sense that we do not require landing exactly at second 0.
-// However, we do account for current seconds to avoid waking too early.
-static uint64_t secondsUntilNextHalfHourSlot(time_t nowLocal)
+/*
+ * configTzTime
+ * sntp setup using TZ environment variable
+ * */
+void configTzTime(const char* tz, const char* server1, const char* server2, const char* server3)
 {
-  struct tm t;
-  localtime_r(&nowLocal, &t);
+    //tcpip_adapter_init();  // Should not hurt anything if already inited
+    esp_netif_init();
+    if(esp_sntp_enabled()){
+        esp_sntp_stop();
+    }
+    sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    sntp_setservername(0, (char*)server1);
+    sntp_setservername(1, (char*)server2);
+    sntp_setservername(2, (char*)server3);
+    sntp_init();
+    setenv("TZ", tz, 1);
+    tzset();
+} // Credits: https://github.com/lmarzen/esp32-weather-epd
 
-  int targetMin = 0;
-  int addHours = 0;
+// ---------------------- Helpers: Time ----------------------
 
-  if (t.tm_min < 30)
+/* Prints the local time to serial monitor.
+ *
+ * Returns true if getting local time was a success, otherwise false.
+ */
+bool printLocalTime(tm *timeInfo)
+{
+  int attempts = 0;
+  while (!getLocalTime(timeInfo) && attempts++ < 3)
   {
-    targetMin = 30;
+    Serial.println("Failed to get the time!");
+    return false;
   }
-  else
+  Serial.println(timeInfo, "%A, %B %d, %Y %H:%M:%S");
+  return true;
+} // Credits: https://github.com/lmarzen/esp32-weather-epd
+
+bool getLocalTime(struct tm * info, uint32_t ms)
+{
+    uint32_t start = millis();
+    time_t now;
+    while((millis()-start) <= ms) {
+        time(&now);
+        localtime_r(&now, info);
+        if(info->tm_year > (2016 - 1900)){
+            return true;
+        }
+        delay(10);
+    }
+    return false;
+} // Credits: https://github.com/lmarzen/esp32-weather-epd
+
+// ---------------------- Helpers: Deep Sleep ----------------------
+
+/* Put esp32 into ultra low-power deep sleep (<11μA).
+ * Aligns wake time to the minute. Sleep times defined in config.cpp.
+ */
+void beginDeepSleep(unsigned long startTime, tm *timeInfo)
+{
+  if (!getLocalTime(timeInfo))
   {
-    targetMin = 0;
-    addHours = 1;
+    Serial.println("Failed to synchronize time before deep-sleep, referencing older time.");
   }
 
-  struct tm target = t;
-  target.tm_sec = 0;
-  target.tm_min = targetMin;
-  target.tm_hour = t.tm_hour + addHours;
+  // time is relative to wake time
+  int curHour = (timeInfo->tm_hour - WAKE_TIME + 24) % 24;
+  const int curMinute = curHour * 60 + timeInfo->tm_min;
+  const int curSecond = curHour * 3600
+                      + timeInfo->tm_min * 60
+                      + timeInfo->tm_sec;
+  const int desiredSleepSeconds = SLEEP_DURATION * 60;
+  const int offsetMinutes = curMinute % SLEEP_DURATION;
+  const int offsetSeconds = curSecond % desiredSleepSeconds;
 
-  // mktime normalizes hour/day/month/year (handles 24->next day and DST changes)
-  time_t targetEpoch = mktime(&target);
+  // align wake time to nearest multiple of SLEEP_DURATION
+  int sleepMinutes = SLEEP_DURATION - offsetMinutes;
+  if (desiredSleepSeconds - offsetSeconds < 120
+   || offsetSeconds / (float)desiredSleepSeconds > 0.95f)
+  { // if we have a sleep time less than 2 minutes OR less 5% SLEEP_DURATION,
+    // skip to next alignment
+    sleepMinutes += SLEEP_DURATION;
+  }
 
-  // If for some reason target is not in the future, add 60 seconds as a fallback
-  if (targetEpoch <= nowLocal) targetEpoch = nowLocal + 60;
-  return (uint64_t)(targetEpoch - nowLocal);
-}
+  // estimated wake time, if this falls in a sleep period then sleepDuration
+  // must be adjusted
+  const int predictedWakeHour = ((curMinute + sleepMinutes) / 60) % 24;
 
-// Returns the epoch (UTC seconds) of the next half-hour slot boundary.
-// A half-hour boundary is any time where epoch % 1800 == 0.
-static time_t nextHalfHourBoundary(time_t now)
-{
-  const time_t period = 1800; // 30 minutes
-  return ((now / period) + 1) * period;
-}
+  uint64_t sleepDuration = sleepMinutes * 60 - timeInfo->tm_sec;
 
-// Returns how many seconds to sleep until the next half-hour boundary.
-// Includes current seconds automatically.
-static uint64_t secondsUntilNextHalfHourBoundary(time_t now)
-{
-  time_t next = nextHalfHourBoundary(now);
-  if (next <= now) next = now + 60; // safety
-  return (uint64_t)(next - now);
-}
+  // add extra delay to compensate for esp32's with fast RTCs.
+  sleepDuration += 3ULL;
+  sleepDuration *= 1.0015f;
 
-static bool isMinuteSlot(time_t nowLocal)
-{
-  struct tm t;
-  localtime_r(&nowLocal, &t);
-  return (t.tm_min == 0 || t.tm_min == 30);
-}
+  esp_sleep_enable_timer_wakeup(sleepDuration * 1000000ULL);
+  Serial.print("Awake for");
+  Serial.println(" "  + String((millis() - startTime) / 1000.0, 3) + "s");
+  Serial.print("Entering deep sleep for");
+  Serial.println(" " + String(sleepDuration) + "s");
+  esp_deep_sleep_start();
+} // Credits: https://github.com/lmarzen/esp32-weather-epd
 
 // ---------------------- Helpers: BME280 ----------------------
 
@@ -206,10 +247,59 @@ static void powerDownBME()
   digitalWrite(PIN_BME_PWR, LOW);
 }
 
+// ---------------------- Helpers: timestamp formatting ----------------------
+
+/* Builds a UTC timestamp string in the format:
+ *   YYYY-MM-DD HH:MM:SS.ffffff+00
+ *
+ * Returns true if the timestamp could be generated, otherwise false.
+ */
+static bool buildUtcTimestamp(char* out, size_t outSize)
+{
+  timeval tv{};
+  if (gettimeofday(&tv, nullptr) != 0)
+  {
+    return false;
+  }
+
+  time_t seconds = tv.tv_sec;
+  tm utc{};
+  gmtime_r(&seconds, &utc);
+
+  // Example: 2026-02-25 16:59:21.561343+00
+  int n = snprintf(
+    out, outSize,
+    "%04d-%02d-%02d %02d:%02d:%02d.%06ld+00",
+    utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
+    utc.tm_hour, utc.tm_min, utc.tm_sec,
+    (long)tv.tv_usec
+  );
+
+  return (n > 0) && ((size_t)n < outSize);
+}
+
+// ---------------------- Helpers: Other ----------------------
+
+void disableBuiltinLED()
+{
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
+  gpio_hold_en(static_cast<gpio_num_t>(LED_BUILTIN));
+  gpio_deep_sleep_hold_en();
+  return;
+} // Credits: https://github.com/lmarzen/esp32-weather-epd
+
 // ---------------------- Supabase POST ----------------------
 
 static int postToSupabase(float temperatureC, float humidityPct)
 {
+  char createdAt[40] = {0};
+  bool timestampIsBuilt = buildUtcTimestamp(createdAt, sizeof(createdAt));
+  if (!timestampIsBuilt)
+  {
+    Serial.println("[TIME] Failed to build UTC timestamp, using empty created_at.");
+  }
+
   WiFiClientSecure client;
   client.setInsecure(); // Replace with CA validation for production
 
@@ -224,7 +314,6 @@ static int postToSupabase(float temperatureC, float humidityPct)
   }
 
   http.addHeader("apikey", SUPABASE_APIKEY);
-  http.addHeader("Authorization", String("Bearer ") + SUPABASE_APIKEY);
   http.addHeader("content-type", "application/json");
   http.addHeader("prefer", "return=minimal");
 
@@ -234,6 +323,15 @@ static int postToSupabase(float temperatureC, float humidityPct)
   payload += ",";
   payload += "\"humidity\":";
   payload += String(humidityPct, 2);
+
+  if (timestampIsBuilt)
+  {
+    payload += ",";
+    payload += "\"created_at\":\"";
+    payload += String(createdAt);
+    payload += "\"";
+  }
+
   payload += "}";
 
   Serial.print("[HTTP] POST payload: ");
@@ -264,8 +362,12 @@ static int postToSupabase(float temperatureC, float humidityPct)
 
 void setup()
 {
+  unsigned long startTime = millis();
   Serial.begin(115200);
-  delay(200);
+  
+  disableBuiltinLED();
+
+  tm timeInfo = {};
 
   Serial.println();
   Serial.println("=== ESP32 BME280 -> Supabase (NTP minute check, deep sleep) ===");
@@ -273,32 +375,24 @@ void setup()
   if (!connectWiFi())
   {
     // If WiFi fails, try again soon
-    deepSleepSeconds(60);
+    beginDeepSleep(startTime, &timeInfo);
   }
 
-  if (!syncTime())
+  // Time Synchronization
+  configTzTime(TZ_INFO, NTP_SERVER_1, NTP_SERVER_2);
+  bool timeConfigured = waitForSNTPSync(&timeInfo);
+  if (!timeConfigured)
   {
-    // If NTP fails, try again soon
-    deepSleepSeconds(60);
+    Serial.println("Time Synchronization Failed");
+    killWiFi();
+    beginDeepSleep(startTime, &timeInfo);
   }
-
-  time_t nowLocal;
-  time(&nowLocal);
-
-  if (!isMinuteSlot(nowLocal))
-  {
-    uint64_t waitSec = secondsUntilNextHalfHourBoundary(nowLocal);
-    Serial.printf("[SCHEDULE] Not at minute 00/30. Sleeping %llu seconds until next slot\n", waitSec);
-    deepSleepSeconds(waitSec);
-  }
-
-  // We are at minute 00 or 30 (seconds do not matter).
+  
   if (!initBME())
   {
-    time(&nowLocal);
-    uint64_t waitSec = secondsUntilNextHalfHourSlot(nowLocal);
-    Serial.printf("[BME] Init failed. Sleeping %llu seconds\n", waitSec);
-    deepSleepSeconds(waitSec);
+    Serial.printf("[BME] Init failed. Going to sleep.");
+    killWiFi();
+    beginDeepSleep(startTime, &timeInfo);
   }
 
   float temperatureC = bme.readTemperature();
@@ -311,15 +405,9 @@ void setup()
 
   postToSupabase(temperatureC, humidityPct);
 
-  // Sleep to the next 00/30 slot
-  time(&nowLocal);
-  uint64_t waitSec = secondsUntilNextHalfHourBoundary(nowLocal);
-  while(waitSec < 10) {
-    delay(200);
-    waitSec = secondsUntilNextHalfHourBoundary(nowLocal);
-  }
-  Serial.printf("[SCHEDULE] Done. Sleeping %llu seconds\n", waitSec);
-  deepSleepSeconds(waitSec);
+  Serial.printf("[SCHEDULE] Done.Going to sleep\n");
+  killWiFi();
+  beginDeepSleep(startTime, &timeInfo);
 }
 
 void loop()
