@@ -314,6 +314,10 @@ void setup()
   // Sleep to the next 00/30 slot
   time(&nowLocal);
   uint64_t waitSec = secondsUntilNextHalfHourBoundary(nowLocal);
+  while(waitSec < 10) {
+    delay(200);
+    waitSec = secondsUntilNextHalfHourBoundary(nowLocal);
+  }
   Serial.printf("[SCHEDULE] Done. Sleeping %llu seconds\n", waitSec);
   deepSleepSeconds(waitSec);
 }
