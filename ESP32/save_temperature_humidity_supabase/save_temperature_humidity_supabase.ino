@@ -42,7 +42,7 @@ static const char* TZ_INFO = "WET0WEST,M3.5.0/1,M10.5.0/2";
 static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
 static const uint32_t HTTP_TIMEOUT_MS         = 8000;
 
-// BME280 pins and address (provided by you)
+// BME280 pins and address
 const uint8_t PIN_BME_SDA = 17;
 const uint8_t PIN_BME_SCL = 16;
 const uint8_t PIN_BME_PWR = 4;    // Irrelevant if sensor powered directly from 3.3V
@@ -153,8 +153,24 @@ static uint64_t secondsUntilNextHalfHourSlot(time_t nowLocal)
 
   // If for some reason target is not in the future, add 60 seconds as a fallback
   if (targetEpoch <= nowLocal) targetEpoch = nowLocal + 60;
-
   return (uint64_t)(targetEpoch - nowLocal);
+}
+
+// Returns the epoch (UTC seconds) of the next half-hour slot boundary.
+// A half-hour boundary is any time where epoch % 1800 == 0.
+static time_t nextHalfHourBoundary(time_t now)
+{
+  const time_t period = 1800; // 30 minutes
+  return ((now / period) + 1) * period;
+}
+
+// Returns how many seconds to sleep until the next half-hour boundary.
+// Includes current seconds automatically.
+static uint64_t secondsUntilNextHalfHourBoundary(time_t now)
+{
+  time_t next = nextHalfHourBoundary(now);
+  if (next <= now) next = now + 60; // safety
+  return (uint64_t)(next - now);
 }
 
 static bool isMinuteSlot(time_t nowLocal)
@@ -271,7 +287,7 @@ void setup()
 
   if (!isMinuteSlot(nowLocal))
   {
-    uint64_t waitSec = secondsUntilNextHalfHourSlot(nowLocal);
+    uint64_t waitSec = secondsUntilNextHalfHourBoundary(nowLocal);
     Serial.printf("[SCHEDULE] Not at minute 00/30. Sleeping %llu seconds until next slot\n", waitSec);
     deepSleepSeconds(waitSec);
   }
@@ -297,7 +313,7 @@ void setup()
 
   // Sleep to the next 00/30 slot
   time(&nowLocal);
-  uint64_t waitSec = secondsUntilNextHalfHourSlot(nowLocal);
+  uint64_t waitSec = secondsUntilNextHalfHourBoundary(nowLocal);
   Serial.printf("[SCHEDULE] Done. Sleeping %llu seconds\n", waitSec);
   deepSleepSeconds(waitSec);
 }
